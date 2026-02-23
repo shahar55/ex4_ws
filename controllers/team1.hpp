@@ -28,6 +28,7 @@ private:
         RETURN_TO_BASE,
         AVOID_COLLISION,
         BLOCK_ENEMY,
+        ESCAPE_STUCK,
     };
 
     struct SPerception {
@@ -48,10 +49,11 @@ private:
 
     bool m_bHasLockedTarget;
     CVector3 m_cLockedTargetPos;
+    CVector3 m_cOriginalTargetPos;
     std::optional<std::size_t> m_optLockedMemoryIndex;
     uint32_t m_uLastTargetSeenStep;
     uint32_t m_uTargetLostCounter;
-
+    Real m_fBestDistToTarget; // המשתנה החדש שלך
     bool m_bHasCandidateTarget;
     CVector3 m_cCandidateTargetPos;
 
@@ -66,8 +68,12 @@ private:
 
     CVector3 m_cLastPos;
     uint32_t m_uStuckCounter;
-
-
+    uint32_t m_uAvoidTimer;
+    // --- Variables for the new Escape logic ---
+    uint32_t m_uEscapeTimer;
+    Real m_fEscapeLeftSpeed;
+    Real m_fEscapeRightSpeed;
+    uint32_t m_uStartChaseStep;
     SPerception Sense();
 
     void SetWheelSpeeds(Real fLeft, Real fRight);

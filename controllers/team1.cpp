@@ -1,3 +1,9 @@
+/**
+ * @file team1.cpp
+ * @brief Ultimate Swarm Implementation 
+ * Features: Anti-Ghosting (Carrier Reports), Tangent Bug, Deadlock Escapes, Owner-Based Locks
+ */
+
 #include "team1.hpp"
 #include <argos3/core/utility/math/angles.h>
 #include <iostream>
@@ -9,10 +15,10 @@ namespace argos {
 
 namespace {
 
-constexpr Real kMaxSpeed = 10.0f;
-constexpr Real kAvoidRadius = 0.18f;
-constexpr Real kCollisionTrigger = 0.14f;
-constexpr Real kCollisionClear = 0.10f;
+constexpr Real kMaxSpeed = 20.0f;
+constexpr Real kAvoidRadius = 0.1f;
+constexpr Real kCollisionTrigger = 0.2f; 
+constexpr Real kCollisionClear = 0.05f;
 
 constexpr Real kFoodMergeTolerance = 0.20f;
 constexpr Real kTargetReachedTolerance = 0.10f;
@@ -24,7 +30,7 @@ constexpr uint32_t kLockStaleTimeout = 60;
 
 constexpr uint32_t kIdleToBlockTimeout = 140;
 constexpr uint32_t kBlockEnemyMaxTimer = 120;
-constexpr uint32_t kPostDropTimer = 25;
+constexpr uint32_t kPostDropTimer = 40;
 
 constexpr std::size_t kTrafficMaxPoints = 6;
 
@@ -37,7 +43,6 @@ struct FoodEntry {
     Real LockDist;
 };
 
-
 static Real Dist(const CVector3& a, const CVector3& b) {
     return (a - b).Length();
 }
@@ -46,6 +51,9 @@ static bool CloseEnough(const CVector3& a, const CVector3& b, Real tol) {
     return Dist(a, b) <= tol;
 }
 
+/* =======================================================================
+ * SHARED MEMORY (HIVE MIND) - IMMUNE TO GHOSTING & INDEX SHIFTS
+ * ======================================================================= */
 class SharedMemory {
 public:
     void UpdateFoods(const std::vector<CVector3>& seen, uint32_t step) {
@@ -99,13 +107,12 @@ public:
         return false;
     }
 
-bool TryLockNear(const Controller1* owner,
-                 const CVector3& myPos,
-                 const CVector3& desired,
-                 uint32_t step,
-                 CVector3& lockedPosOut,
-                 std::size_t& idxOut)
- {
+    bool TryLockNear(const Controller1* owner,
+                     const CVector3& myPos,
+                     const CVector3& desired,
+                     uint32_t step,
+                     CVector3& lockedPosOut,
+                     std::size_t& idxOut) {
         std::lock_guard<std::mutex> lock(Mtx);
         CleanupUnsafe(step);
 
@@ -126,8 +133,6 @@ bool TryLockNear(const Controller1* owner,
         FoodEntry& f = Foods[match];
         if(f.Locked) {
             Real myDist = Dist(myPos, f.Pos);
-
-            // If I already own it, refresh lock timestamps
             if(f.Owner == owner) {
                 f.LockedAt = step;
                 f.LastSeen = std::max(f.LastSeen, step);
@@ -137,8 +142,7 @@ bool TryLockNear(const Controller1* owner,
                 return true;
             }
 
-            // Allow takeover only if I'm meaningfully closer OR the lock is getting stale
-            const bool stale = (step - f.LockedAt) > 40; // recover faster from stuck owners
+            const bool stale = (step - f.LockedAt) > 40; 
             const bool muchCloser = (myDist + 0.15f) < f.LockDist;
 
             if(stale || muchCloser) {
@@ -151,11 +155,8 @@ bool TryLockNear(const Controller1* owner,
                 idxOut = match;
                 return true;
             }
-
             return false;
         }
-
-
 
         f.Locked = true;
         f.Owner = owner;
@@ -167,17 +168,57 @@ bool TryLockNear(const Controller1* owner,
         return true;
     }
 
-    void ReleaseLock(const Controller1* owner, std::size_t idx, bool erase) {
+    /* SAFE RETRIEVAL: Finds target by Owner pointer, immune to index shifts */
+    bool GetMyLockedFoodPos(const Controller1* owner, CVector3& outPos) const {
         std::lock_guard<std::mutex> lock(Mtx);
-        if(idx >= Foods.size()) return;
-        if(Foods[idx].Locked && Foods[idx].Owner == owner) {
-            if(erase) {
-                Foods.erase(Foods.begin() + idx);
-            } else {
-                Foods[idx].Locked = false;
-                Foods[idx].Owner = nullptr;
+        for(const auto& f : Foods) {
+            if(f.Locked && f.Owner == owner) {
+                outPos = f.Pos;
+                return true;
             }
         }
+        return false;
+    }
+
+    /* SAFE RELEASE: Erases target by Owner pointer */
+    void ReleaseMyLock(const Controller1* owner, bool erase_it) {
+        std::lock_guard<std::mutex> lock(Mtx);
+        for (auto it = Foods.begin(); it != Foods.end(); ) {
+            if (it->Locked && it->Owner == owner) {
+                if (erase_it) {
+                    it = Foods.erase(it);
+                } else {
+                    it->Locked = false;
+                    it->Owner = nullptr;
+                    ++it;
+                }
+            } else {
+                ++it;
+            }
+        }
+    }
+
+    /* --- NEW: ANTI-GHOSTING CARRIER SYSTEM --- */
+    void ReportCarrier(const CVector3& pos, uint32_t step) {
+        std::lock_guard<std::mutex> lock(Mtx);
+        // Remove old reports (>10 ticks)
+        Carriers.erase(std::remove_if(Carriers.begin(), Carriers.end(),
+                                      [&](const std::pair<CVector3, uint32_t>& c) {
+                                          return step - c.second > 10; 
+                                      }),
+                       Carriers.end());
+        Carriers.push_back({pos, step});
+    }
+
+    bool IsNearCarrier(const CVector3& pos, uint32_t step) const {
+        std::lock_guard<std::mutex> lock(Mtx);
+        for(const auto& c : Carriers) {
+            // If food is within 25cm of a robot carrying food, it's a ghost!
+            if (step - c.second <= 10 && Dist(c.first, pos) < 0.25f) {
+                return true;
+            }
+        }
+        return false;
     }
 
 private:
@@ -199,6 +240,7 @@ private:
 
     mutable std::mutex Mtx;
     std::vector<FoodEntry> Foods;
+    std::vector<std::pair<CVector3, uint32_t>> Carriers; // Stores carrier positions
 };
 
 static SharedMemory& SM() {
@@ -207,6 +249,11 @@ static SharedMemory& SM() {
 }
 
 } // namespace
+
+
+/* =======================================================================
+ * CONTROLLER IMPLEMENTATION
+ * ======================================================================= */
 
 Controller1::Controller1() :
     m_eState(EState::SEARCH),
@@ -223,7 +270,10 @@ Controller1::Controller1() :
     m_uBlockEnemyTimer(0),
     m_uPostDropTimer(0),
     m_uSearchTurnTimer(0),
-    m_fSearchTurnBias(0.0f) {}
+    m_fSearchTurnBias(0.0f),
+    m_uEscapeTimer(0),
+    m_fEscapeLeftSpeed(0.0f),
+    m_fEscapeRightSpeed(0.0f) {}
 
 void Controller1::Init(TConfigurationNode& t_tree) {
     ForagingController::Init(t_tree);
@@ -239,15 +289,21 @@ void Controller1::Init(TConfigurationNode& t_tree) {
     m_uBlockEnemyTimer = 0;
     m_uPostDropTimer = 0;
     m_uSearchTurnTimer = 0;
-    m_fSearchTurnBias = 0.0f;
+    m_fSearchTurnBias = m_rng->Uniform(CRange<Real>(-1.0f, 1.0f));
     m_cLastPos = CVector3(0,0,0);
     m_uStuckCounter = 0;
     m_deqTrafficPoints.clear();
+    m_uAvoidTimer = 0;
+    m_uEscapeTimer = 0;
+    m_fEscapeLeftSpeed = 0.0f;
+    m_fEscapeRightSpeed = 0.0f;
+    
     SetWheelSpeeds(0.0f, 0.0f);
 }
 
 Real Controller1::Clamp(Real v, Real lo, Real hi) {
     return (v < lo ? lo : (v > hi ? hi : v));
+    LOGERR<<"sdds";
 }
 
 void Controller1::SetWheelSpeeds(Real fLeft, Real fRight) {
@@ -258,6 +314,7 @@ void Controller1::SetWheelSpeeds(Real fLeft, Real fRight) {
 
 Controller1::SPerception Controller1::Sense() {
     SPerception s;
+    
     const auto& pr = m_pcPositioning->GetReading();
     s.Position = pr.Position;
     CRadians z, y, x;
@@ -265,22 +322,18 @@ Controller1::SPerception Controller1::Sense() {
     s.Yaw = z;
 
     s.AvoidanceVector.Set(0.0f, 0.0f);
-    s.ProximityLevel = 0.0f; // MAX proximity (0..1), higher = closer
+    s.ProximityLevel = 0.0f;
 
     m_pcRangefinders->Visit([&](const auto& rr) {
-        // Track strongest proximity reading (closest obstacle)
         if(rr.Proximity > s.ProximityLevel) s.ProximityLevel = rr.Proximity;
 
-        // Avoid when proximity is meaningful
         if(rr.Proximity > 0.05f) {
             const CQuaternion& q = std::get<2>(rr.Configuration);
             CRadians sy, sp, sr;
             q.ToEulerAngles(sy, sp, sr);
-
-            // Stronger when closer (bigger proximity)
             Real strength = rr.Proximity;
             CRadians global_ang = s.Yaw + sy + CRadians::PI;
-            s.AvoidanceVector += CVector2(strength, global_ang);
+            s.AvoidanceVector += CVector2(strength * Cos(global_ang), strength * Sin(global_ang));
         }
     });
 
@@ -298,6 +351,13 @@ Controller1::SPerception Controller1::Sense() {
         CVector3 wpos(s.Position.GetX() + dist * Cos(ang),
                       s.Position.GetY() + dist * Sin(ang),
                       0.0f);
+                      
+        // --- ANTI-GHOSTING FILTER ---
+        // If this food is near a carrier, it's not real floor food. Ignore it!
+        if (SM().IsNearCarrier(wpos, m_uStepCount)) {
+            continue; 
+        }
+
         s.FoodWorldPositions.push_back(wpos);
         if(dist < s.NearestFoodMetric) {
             s.NearestFoodMetric = dist;
@@ -317,13 +377,13 @@ void Controller1::DriveWithVector(const SPerception& s,
     CVector2 cFinal = cGlobalDir + cExtra;
     if(cFinal.Length() < 1e-6f) {
         Real bias = Clamp(m_fSearchTurnBias, -1.0f, 1.0f);
-        if(Abs(bias) < 0.15f) bias = (bias < 0 ? -0.6f : 0.6f); // enforce non-zero
+        if(Abs(bias) < 0.15f) bias = (bias < 0 ? -0.6f : 0.6f); 
         Real turn = bias * 0.35f;
-        SetWheelSpeeds(-turn * kMaxSpeed, turn * kMaxSpeed);
+        SetWheelSpeeds(-turn * kMaxSpeed * 2, turn * kMaxSpeed);
         return;
     }
 
-    if(cFinal.Length() > 1.0f) cFinal.Normalize();
+    if(cFinal.Length() > 1e-6f) cFinal.Normalize();
 
     Real fLocalX = cFinal.GetX() * Cos(-s.Yaw) - cFinal.GetY() * Sin(-s.Yaw);
     Real fLocalY = cFinal.GetX() * Sin(-s.Yaw) + cFinal.GetY() * Cos(-s.Yaw);
@@ -334,13 +394,12 @@ void Controller1::DriveWithVector(const SPerception& s,
     Real fLin = fLocalX * kMaxSpeed * fSpeedScale;
     Real fRot = fLocalY * kMaxSpeed * fTurnGain;
 
-    // Enforce minimum forward speed when we generally want to go forward
     if(fLocalX > 0.05f) {
         Real minLin = 0.25f * kMaxSpeed * fSpeedScale;
         if(fLin < minLin) fLin = minLin;
     }
 
-    SetWheelSpeeds(fLin - fRot, fLin + fRot);
+    SetWheelSpeeds(fLin - fRot/2, fLin + fRot);
 }
 
 CVector3 Controller1::SelectClosestBase(const CVector3& cMyPos) const {
@@ -383,9 +442,7 @@ bool Controller1::TryLockCandidateTarget(CVector3& cLockedPosOut, std::size_t& u
 }
 
 void Controller1::ReleaseLockedTarget(bool bEraseFromMemory) {
-    if(m_optLockedMemoryIndex.has_value()) {
-        SM().ReleaseLock(this, m_optLockedMemoryIndex.value(), bEraseFromMemory);
-    }
+    SM().ReleaseMyLock(this, bEraseFromMemory);
     m_bHasLockedTarget = false;
     m_optLockedMemoryIndex = std::nullopt;
     m_uLastTargetSeenStep = 0;
@@ -403,55 +460,65 @@ void Controller1::UpdateTrafficPoints(const SPerception& s) {
 
 void Controller1::ControlStep() {
     const std::string id = GetId();
-
     ++m_uStepCount;
-    SPerception s = Sense();
 
-    if((s.Position - m_cLastPos).Length() < 0.002f) ++m_uStuckCounter;
-    else m_uStuckCounter = 0;
-    m_cLastPos = s.Position;
-
-    if(m_uStuckCounter > 25 && m_eState != EState::AVOID_COLLISION) {
-        m_ePrevState = m_eState;
-        m_eState = EState::AVOID_COLLISION;
+    // --- CARRIER BROADCAST ---
+    // If I have food, tell the Hive Mind my position so others ignore my food!
+    if (hasFood()) {
+        SM().ReportCarrier(m_pcPositioning->GetReading().Position, m_uStepCount);
     }
 
-    if(hasFood()) 
-    {
+    SPerception s = Sense();
+
+    // --- STUCK DETECTION & ESCAPE ---
+    if((s.Position - m_cLastPos).Length() < 0.03f) {
+        ++m_uStuckCounter;
+    } else {
+        m_uStuckCounter = 0;
+        m_cLastPos = s.Position; 
+    }
+
+    // fast unstuck behave
+    if(m_uStuckCounter > 10 && m_eState != EState::ESCAPE_STUCK) {
+        m_ePrevState = m_eState;
+        //m_fSearchTurnBias = (m_rng->Uniform(CRange<Real>(0.0f, 1.0f)) > 0.5f ? 1.5f : -1.5f);
+        m_eState = EState::ESCAPE_STUCK;
+        
+        m_uEscapeTimer = 80;
+        m_fSearchTurnBias = m_rng->Uniform(CRange<Real>(-1.0f, 1.0f));
+        m_fEscapeLeftSpeed = -kMaxSpeed;
+        m_fEscapeRightSpeed = -kMaxSpeed * 0.1f;
+        
+        if (m_rng->Uniform(CRange<Real>(0.0f, 1.0f)) < 0.5f) {
+            std::swap(m_fEscapeLeftSpeed, m_fEscapeRightSpeed);
+        }
+    }
+    
+    // --- UNIVERSAL FOOD CHECK ---
+    if(hasFood()) {
         m_bHasCandidateTarget = false;
         m_uIdleNoTargetCounter = 0;
         m_uBlockEnemyTimer = 0;
 
-        if(m_eState != EState::RETURN_TO_BASE &&
-        m_eState != EState::AVOID_COLLISION) {
-            ReleaseLockedTarget(false);
+        if(m_eState != EState::RETURN_TO_BASE && m_eState != EState::ESCAPE_STUCK) {
+            ReleaseLockedTarget(true); // Destroy target from memory, we have it!
             m_eState = EState::RETURN_TO_BASE;
         }
     }
 
     DoMemorySync(s);
-
     UpdateTrafficPoints(s);
 
-    if(hasFood() && m_eState != EState::RETURN_TO_BASE && m_eState != EState::AVOID_COLLISION) {
-        std::cout << "[Step " << m_uStepCount << "] Action: Picked up food (post-mem sync), switching to RETURN_TO_BASE" << std::endl;
-        ReleaseLockedTarget(false);
-        m_bHasCandidateTarget = false;
-        m_uBlockEnemyTimer = 0;
-        m_uIdleNoTargetCounter = 0;
-        m_eState = EState::RETURN_TO_BASE;
-    }
-
+    // Collision Check
     if(m_eState != EState::AVOID_COLLISION &&
-    m_eState != EState::RETURN_TO_BASE &&
-    s.ProximityLevel > kCollisionTrigger)
+       m_eState != EState::RETURN_TO_BASE &&
+       m_eState != EState::ESCAPE_STUCK &&
+       m_uPostDropTimer == 0 && 
+       s.ProximityLevel > kCollisionTrigger)
     {
-        std::cout << "[Step " << m_uStepCount << "] Action: Collision detected (prox=" 
-                << s.ProximityLevel << "), switching to AVOID_COLLISION" << std::endl;
         m_ePrevState = m_eState;
         m_eState = EState::AVOID_COLLISION;
     }
-
 
     if(m_uPostDropTimer > 0) --m_uPostDropTimer;
 
@@ -459,57 +526,68 @@ void Controller1::ControlStep() {
     CVector2 cExtra(0.0f, 0.0f);
     Real speedScale = 1.0f;
     Real turnGain = 1.6f;
-
+    if (m_eState != EState::AVOID_COLLISION) {
+        m_uAvoidTimer = 0;
+    }
     switch(m_eState) {
+        
+        case EState::ESCAPE_STUCK: {
+            SetWheelSpeeds(m_fEscapeLeftSpeed, m_fEscapeRightSpeed);
+            if (m_uEscapeTimer > 0) {
+                --m_uEscapeTimer;
+            } else {
+                m_uStuckCounter = 0; 
+                
+                if (m_ePrevState == EState::GO_TO_TARGET || m_ePrevState == EState::TARGET_LOCKING) {
+                    ReleaseLockedTarget(false); 
+                }
+                
+                m_eState = EState::SEARCH;
+                m_uSearchTurnTimer = 0;
+            }
+            return; 
+        }
         case EState::AVOID_COLLISION: {
-            std::cout << "[Step " << m_uStepCount << "] State: AVOID_COLLISION" << std::endl;
             CVector2 cAvoid = s.AvoidanceVector;
             if(cAvoid.Length() < 1e-6f) {
-                SetWheelSpeeds(-0.5f * kMaxSpeed, 0.5f * kMaxSpeed);
+                SetWheelSpeeds(-kMaxSpeed * 0.5f, kMaxSpeed * 0.5f); 
                 return;
             }
-            if(cAvoid.Length() > 1.0f) cAvoid.Normalize();
-            Real fSpeed = 0.8f;
-            DriveWithVector(s, cAvoid, fSpeed, 2.4f, CVector2(0.0f, 0.0f));
+            cAvoid.Normalize();
+
+            CVector2 cTangent(-cAvoid.GetY(), cAvoid.GetX());
+            
+            CVector2 cNewDir = (cAvoid * 0.6f) + (cTangent * 0.8f);
+            
+            DriveWithVector(s, cNewDir, 0.7f, 2.5f, CVector2(0,0));
 
             if(s.ProximityLevel < kCollisionClear) {
-                EState back = m_ePrevState;
-                if(hasFood()) back = EState::RETURN_TO_BASE;
-                std::cout << "[Step " << m_uStepCount << "] Action: Collision cleared (prox="
-                        << s.ProximityLevel << "), returning to previous state" << std::endl;
-                m_eState = back;
+                m_eState = hasFood() ? EState::RETURN_TO_BASE : m_ePrevState;
+                m_uStuckCounter = 0;
             }
             return;
         }
-
         case EState::SEARCH: {
-            LogWithId(id, m_uStepCount, "State: SEARCH");
-
             if(hasFood()) {
-                LogWithId(id, m_uStepCount, "Action: Picked up food (SEARCH), switching to RETURN_TO_BASE");
                 m_eState = EState::RETURN_TO_BASE;
                 break;
             }
 
-            // If we see food, move into TARGET_LOCKING (do NOT lock here)
+            if (m_uPostDropTimer == 0) {
+                if(s.HasFoodInView) {
+                    m_bHasCandidateTarget = true;
+                    m_cCandidateTargetPos = s.NearestFoodWorldPos;
+                    m_eState = EState::TARGET_LOCKING;
+                    break;
+                }
 
-            if(s.HasFoodInView) {
-                LogWithId(id, m_uStepCount, "Action: Food in view, switching to TARGET_LOCKING");
-                m_bHasCandidateTarget = true;
-                m_cCandidateTargetPos = s.NearestFoodWorldPos;
-                m_eState = EState::TARGET_LOCKING;
-                break;
-            }
-
-            // Or use memory candidate
-            CVector3 memCandidate;
-
-            if(TrySelectCandidateFromMemory(s.Position, memCandidate)) {
-                LogWithId(id, m_uStepCount, "Action: Using memory candidate, switching to TARGET_LOCKING");
-                m_bHasCandidateTarget = true;
-                m_cCandidateTargetPos = memCandidate;
-                m_eState = EState::TARGET_LOCKING;
-                break;
+                CVector3 memCandidate;
+                if(TrySelectCandidateFromMemory(s.Position, memCandidate)) {
+                    m_bHasCandidateTarget = true;
+                    m_cCandidateTargetPos = memCandidate;
+                    m_eState = EState::TARGET_LOCKING;
+                    break;
+                }
             }
 
             bool anyUnlocked = SM().HasUnlocked(m_uStepCount);
@@ -517,7 +595,6 @@ void Controller1::ControlStep() {
             if(!anyUnlocked && m_uPostDropTimer == 0) {
                 ++m_uIdleNoTargetCounter;
                 if(m_uIdleNoTargetCounter > kIdleToBlockTimeout) {
-                    LogWithId(id, m_uStepCount, "Action: No unlocked food, switching to BLOCK_ENEMY");
                     m_uIdleNoTargetCounter = 0;
                     m_uBlockEnemyTimer = kBlockEnemyMaxTimer;
                     m_eState = EState::BLOCK_ENEMY;
@@ -534,11 +611,9 @@ void Controller1::ControlStep() {
                 --m_uSearchTurnTimer;
             }
 
-            CVector2 forward;
-            forward.Set(Cos(s.Yaw), Sin(s.Yaw));
-            CVector2 drift;
+            CVector2 forward(Cos(s.Yaw), Sin(s.Yaw));
             CRadians drift_angle = s.Yaw + CRadians(m_fSearchTurnBias * 0.55f);
-            drift.Set(Cos(drift_angle), Sin(drift_angle));
+            CVector2 drift(Cos(drift_angle), Sin(drift_angle));
             cNav = forward * 0.35f + drift * 0.65f;
 
             if(!m_basePositions.empty()) {
@@ -561,76 +636,61 @@ void Controller1::ControlStep() {
         }
 
         case EState::TARGET_LOCKING: {
-            LogWithId(id, m_uStepCount, "State: TARGET_LOCKING");
-
-                if(hasFood()) {
-                    LogWithId(id, m_uStepCount, "Action: Picked up food (TARGET_LOCKING), switching to RETURN_TO_BASE");
-                    m_eState = EState::RETURN_TO_BASE;
-                    break;
-                }
-
-
-                if(!m_bHasCandidateTarget) {
-                    LogWithId(id, m_uStepCount, "Action: No candidate target, switching to SEARCH");
-                    m_eState = EState::SEARCH;
-                    break;
-                }
-
-                // Keep candidate fresh if we still see food (helps lock near true position)
-                if(s.HasFoodInView) {
-                    m_cCandidateTargetPos = s.NearestFoodWorldPos;
-                }
-
-                // Try lock atomically
-                CVector3 lockedPos;
-                std::size_t idx = 0;
-
-                if(TryLockCandidateTarget(lockedPos, idx)) {
-                    LogWithId(id, m_uStepCount, "Action: Locked candidate target, switching to GO_TO_TARGET");
-                    m_bHasLockedTarget = true;
-                    m_optLockedMemoryIndex = idx;
-                    m_cLockedTargetPos = lockedPos;
-                    m_uLastTargetSeenStep = m_uStepCount;
-                    m_uTargetLostCounter = 0;
-                    m_bHasCandidateTarget = false;
-                    m_eState = EState::GO_TO_TARGET;
-                    break;
-                }
-
-                // Lock failed: keep moving toward candidate for a short time, then give up
-                CVector3 diff3 = m_cCandidateTargetPos - s.Position;
-                cNav.Set(diff3.GetX(), diff3.GetY());
-                cExtra = s.AvoidanceVector * 2.8f;
-                speedScale = 0.75f;
-                turnGain = 1.8f;
-
-                // Deterministic backoff to avoid permanent chasing of reserved targets
-
-                if(m_uStepCount % 20 == 0) {
-                    LogWithId(id, m_uStepCount, "Action: Lock failed, backoff to SEARCH");
-                    m_bHasCandidateTarget = false;
-                    m_eState = EState::SEARCH;
-                }
-
+            if(hasFood()) {
+                m_eState = EState::RETURN_TO_BASE;
                 break;
             }
 
-
-        case EState::GO_TO_TARGET: {
-            LogWithId(id, m_uStepCount, "State: GO_TO_TARGET");
-
-            if(!m_bHasLockedTarget) {
-                LogWithId(id, m_uStepCount, "Action: Lost locked target, switching to SEARCH");
+            if(!m_bHasCandidateTarget) {
                 m_eState = EState::SEARCH;
                 break;
             }
 
+            if(s.HasFoodInView) {
+                m_cCandidateTargetPos = s.NearestFoodWorldPos;
+            }
+
+            CVector3 lockedPos;
+            std::size_t idx = 0;
+
+            if(TryLockCandidateTarget(lockedPos, idx)) {
+                m_bHasLockedTarget = true;
+                m_optLockedMemoryIndex = idx;
+                m_cLockedTargetPos = lockedPos;
+                m_uLastTargetSeenStep = m_uStepCount;
+                m_uTargetLostCounter = 0;
+                m_bHasCandidateTarget = false;
+                m_eState = EState::GO_TO_TARGET;
+                break;
+            }
+
+            CVector3 diff3 = m_cCandidateTargetPos - s.Position;
+            cNav.Set(diff3.GetX(), diff3.GetY());
+            cExtra = s.AvoidanceVector * 2.8f;
+            speedScale = 0.75f;
+            turnGain = 1.8f;
+
+            if(m_uStepCount % 20 == 0) {
+                m_bHasCandidateTarget = false;
+                m_eState = EState::SEARCH;
+            }
+            break;
+        }
+
+        case EState::GO_TO_TARGET: {
+            if(!m_bHasLockedTarget) {
+                m_eState = EState::SEARCH;
+                break;
+            }
 
             if(hasFood()) {
-                LogWithId(id, m_uStepCount, "Action: Picked up food (GO_TO_TARGET), switching to RETURN_TO_BASE");
-                ReleaseLockedTarget(false);
                 m_eState = EState::RETURN_TO_BASE;
                 break;
+            }
+
+            CVector3 livePos;
+            if (SM().GetMyLockedFoodPos(this, livePos)) {
+                m_cLockedTargetPos = livePos; 
             }
 
             bool refreshed = false;
@@ -648,12 +708,10 @@ void Controller1::ControlStep() {
             CVector3 diff3 = m_cLockedTargetPos - s.Position;
             Real distT = diff3.Length();
 
-
             if(distT < kTargetReachedTolerance) {
                 if(!refreshed && !s.HasFoodInView) {
                     ++m_uTargetLostCounter;
-                    if(m_uTargetLostCounter > 8) {
-                        LogWithId(id, m_uStepCount, "Action: Target lost at close range, switching to SEARCH");
+                    if(m_uTargetLostCounter > 40) {
                         ReleaseLockedTarget(true);
                         m_eState = EState::SEARCH;
                         break;
@@ -663,15 +721,16 @@ void Controller1::ControlStep() {
                 }
             }
 
-
             if(m_uStepCount - m_uLastTargetSeenStep > kTargetLostTimeout) {
-                LogWithId(id, m_uStepCount, "Action: Target lost (timeout), switching to SEARCH");
                 ReleaseLockedTarget(false);
                 m_eState = EState::SEARCH;
                 break;
             }
 
             cNav.Set(diff3.GetX(), diff3.GetY());
+            if(cNav.Length() > 0.0f) {
+                cNav.Normalize();
+            }
             cExtra = s.AvoidanceVector * 2.2f;
             speedScale = 0.95f;
             turnGain = 1.8f;
@@ -679,53 +738,41 @@ void Controller1::ControlStep() {
         }
 
         case EState::RETURN_TO_BASE: {
-            LogWithId(id, m_uStepCount, "State: RETURN_TO_BASE");
-            CVector3 base = SelectClosestBase(s.Position);
-            CVector3 diff3 = base - s.Position;
-            Real distB = diff3.Length();
-
-
-            if(distB < kBaseReachedTolerance) {
-                LogWithId(id, m_uStepCount, "Action: Reached base, dropping food and switching to SEARCH");
-                if(hasFood()) ClearCarriedFoodId();
-                ReleaseLockedTarget(false);
+            if (!hasFood()) {
+                ReleaseLockedTarget(true); 
                 m_uPostDropTimer = kPostDropTimer;
                 m_eState = EState::SEARCH;
-                cNav.Set(0.0f, 0.0f);
-                m_fSearchTurnBias = -0.6f;
-                DriveWithVector(s, cNav, 0.0f, 1.0f, CVector2(0.0f, 0.0f));
-                return;
+                break; 
             }
 
+            CVector3 base = SelectClosestBase(s.Position);
+            CVector3 diff3 = base - s.Position;
+            Real distToBase = diff3.Length();
+            
             cNav.Set(diff3.GetX(), diff3.GetY());
-            cExtra = s.AvoidanceVector * 2.6f;
+            if(cNav.Length() > 0.0f) cNav.Normalize(); 
+            
+            // Base Push: Ignore others when very close to base to prevent Yo-Yo
+            if (distToBase < 0.35f) {
+                cExtra = s.AvoidanceVector * 0.2f; 
+            } else {
+                cExtra = s.AvoidanceVector * 2.1f; 
+            }
+            
             speedScale = 1.0f;
             turnGain = 1.7f;
-
-            if(distB < 0.6f) {
-                CVector3 away3 = s.Position - base;
-                CVector2 away(away3.GetX(), away3.GetY());
-                if(away.Length() > 1e-6f) away.Normalize();
-                Real mag = (0.6f - distB) / 0.6f;
-                cExtra += away * (0.6f * mag);
-            }
             break;
         }
 
         case EState::BLOCK_ENEMY: {
-            LogWithId(id, m_uStepCount, "State: BLOCK_ENEMY");
-
             if(hasFood()) {
-                LogWithId(id, m_uStepCount, "Action: Picked up food (BLOCK_ENEMY), switching to RETURN_TO_BASE");
                 m_eState = EState::RETURN_TO_BASE;
                 break;
             }
 
             if(m_uBlockEnemyTimer > 0) --m_uBlockEnemyTimer;
 
-
             if(s.HasFoodInView || SM().HasUnlocked(m_uStepCount) || m_uBlockEnemyTimer == 0) {
-                LogWithId(id, m_uStepCount, "Action: Ending BLOCK_ENEMY, switching to SEARCH");
                 m_eState = EState::SEARCH;
                 break;
             }
@@ -738,17 +785,15 @@ void Controller1::ControlStep() {
             } else if(!m_basePositions.empty()) {
                 target = SelectClosestBase(s.Position);
             }
-
-            CVector3 diff3 = target - s.Position;
+            CVector3 diff3 = s.Position - target; // change direction
             Real dist = diff3.Length();
 
             if(dist < 0.25f) {
                 cNav.Set(0.0f, 0.0f);
-                m_fSearchTurnBias = 0.8f;
+                m_fSearchTurnBias = 1.0f; 
                 DriveWithVector(s, cNav, 0.0f, 1.0f, CVector2(0.0f, 0.0f));
                 return;
             }
-
             cNav.Set(diff3.GetX(), diff3.GetY());
             cExtra = s.AvoidanceVector * 2.4f;
             speedScale = 0.55f;
@@ -757,20 +802,24 @@ void Controller1::ControlStep() {
         }
     }
 
-    // If avoidance cancels the goal, keep some goal to avoid freezing
+    // Tangent Bug: Smooth wall sliding
     if(cNav.Length() > 1e-6f) {
         CVector2 navN = cNav; navN.Normalize();
         if(cExtra.Length() > 1e-6f) {
             CVector2 extraN = cExtra; extraN.Normalize();
             Real dot = navN.GetX()*extraN.GetX() + navN.GetY()*extraN.GetY();
-            // If avoidance is strongly opposing the goal, reduce it
-            if(dot < -0.75f) {
-                cExtra *= 0.35f;
+            
+            if(dot < -0.6f) {
+                cExtra*= 0.35f;//.Set(-cExtra.GetY(), cExtra.GetX()); 
             }
         }
     }
-
-
+    // smooth forces
+    if (s.ProximityLevel > 0.05f) {
+        Real damping = Clamp(1.0f - (s.ProximityLevel * 2.0f), 0.1f, 1.0f);
+        cNav *= damping;
+    }
+    
     DriveWithVector(s, cNav, speedScale, turnGain, cExtra);
 }
 

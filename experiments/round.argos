@@ -71,7 +71,7 @@
 		<distribute>
 		<position method="uniform" min="-1.9,-1.9,0" max="1.9,1.9,0"/>
 		<orientation method="uniform" min="0,0,0" max="360,0,0"/>
-		<entity quantity="4" max_trials="100">
+		<entity quantity="5" max_trials="100">
 			<pipuck id="puck1-" led_medium="leds" camera_aperture="80">
 			<controller config="controller1"/>
 			</pipuck>
