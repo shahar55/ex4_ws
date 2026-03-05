@@ -1,24 +1,4 @@
-/**
- * @file team1.cpp
- * @brief Ultimate Swarm Implementation 
- * Features: Anti-Ghosting (Carrier Reports), Tangent Bug, Deadlock Escapes, Owner-Based Locks
- *
- * Patch 2026-03-05:
- *  - Collision "break + resume": on ANY collision (enemy or teammate) we perform a short deterministic
- *    back+turn(+forward) maneuver, then resume the current objective (target/base), instead of oscillating/stalling.
- *  - When near-base / likely teammate traffic, the maneuver is "SOFT" (minimal direction change).
- *  - When very close / head-on / strong obstacle, the maneuver is "HARD" (bigger break).
- *  - Improved collision logging with chosen turn side, phase, and classification.
- */
-
 #include "team1.hpp"
-#include <argos3/core/utility/math/angles.h>
-#include <iostream>
-#include <algorithm>
-#include <limits>
-#include <mutex>
-#include <cmath>
-#include <iomanip>
 
 namespace argos {
 
@@ -258,11 +238,6 @@ static SharedMemory& SM() {
 }
 
 } // namespace
-
-
-/* =======================================================================
- * CONTROLLER IMPLEMENTATION
- * ======================================================================= */
 
 Controller1::Controller1() :
     m_eState(EState::SEARCH),

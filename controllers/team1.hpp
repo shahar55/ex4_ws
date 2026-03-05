@@ -8,6 +8,13 @@
 #include <deque>
 #include <optional>
 #include <vector>
+#include <argos3/core/utility/math/angles.h>
+#include <iostream>
+#include <algorithm>
+#include <limits>
+#include <mutex>
+#include <cmath>
+#include <iomanip>
 
 namespace argos {
 
@@ -59,7 +66,7 @@ private:
     std::optional<std::size_t> m_optLockedMemoryIndex;
     uint32_t m_uLastTargetSeenStep;
     uint32_t m_uTargetLostCounter;
-    Real m_fBestDistToTarget; // המשתנה החדש שלך
+    Real m_fBestDistToTarget;
     bool m_bHasCandidateTarget;
     CVector3 m_cCandidateTargetPos;
 
