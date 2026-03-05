@@ -20,7 +20,7 @@ public:
     void ControlStep() override;
     uint8_t getTeamId() const override { return 1; }
 
-private:
+public:
     enum class EState : uint8_t {
         SEARCH = 0,
         TARGET_LOCKING,
@@ -31,11 +31,17 @@ private:
         ESCAPE_STUCK,
     };
 
+private:
+
     struct SPerception {
         CVector3 Position;
         CRadians Yaw;
         CVector2 AvoidanceVector;
         Real ProximityLevel;
+        // Nearest robot blob (any team). Used for teammate deadlock prevention.
+        bool HasRobotInView;
+        Real NearestRobotDist;
+        CRadians NearestRobotBearing;
         std::vector<CVector3> FoodWorldPositions;
         bool HasFoodInView;
         CVector3 NearestFoodWorldPos;
@@ -68,12 +74,45 @@ private:
 
     CVector3 m_cLastPos;
     uint32_t m_uStuckCounter;
+
+    // --- Collision "break + resume" routine (works for enemy and teammate) ---
     uint32_t m_uAvoidTimer;
+    uint8_t  m_uAvoidPhase;      // 0=backup, 1=turn, 2=forward
+    Real     m_fAvoidTurnSign;   // -1 or +1 deterministic
+    bool     m_bAvoidHard;       // hard break (enemy-like) vs soft (teammate-like)
+    EState   m_eAvoidResumeState;
+
+    // ---- Teammate deadlock (same-team collision) prevention & recovery ----
+    // Last wheel commands (used to detect "commanding forward but not moving")
+    Real m_fLastLeftCmd;
+    Real m_fLastRightCmd;
+
+    // Goal-progress tracking
+    Real m_fPrevGoalDist;
+    Real m_fBestGoalDist;
+    uint32_t m_uNoProgressCounter;
+
+    // Team-deadlock detection + bounded recovery routine
+    uint32_t m_uTeamDeadlockCounter;
+    uint32_t m_uTeamDeadlockRetries;
+    bool m_bTeamRecoveryActive;
+    uint32_t m_uTeamRecoveryTimer;
+    uint8_t m_uTeamRecoveryPhase; // 0=reverse,1=rotate,2=forward
+    EState m_eResumeState;
+
+    // Teammate avoidance hysteresis (prevents left/right oscillation)
+    CVector2 m_cTeammateAvoidLPF;
+    UInt32   m_uTeammateAvoidHold;
+
+    // Periodic summary
+    uint32_t m_uLastSummaryStep;
+
     // --- Variables for the new Escape logic ---
     uint32_t m_uEscapeTimer;
     Real m_fEscapeLeftSpeed;
     Real m_fEscapeRightSpeed;
     uint32_t m_uStartChaseStep;
+
     SPerception Sense();
 
     void SetWheelSpeeds(Real fLeft, Real fRight);

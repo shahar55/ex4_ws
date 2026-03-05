@@ -2,6 +2,13 @@
  * @file team1.cpp
  * @brief Ultimate Swarm Implementation 
  * Features: Anti-Ghosting (Carrier Reports), Tangent Bug, Deadlock Escapes, Owner-Based Locks
+ *
+ * Patch 2026-03-05:
+ *  - Collision "break + resume": on ANY collision (enemy or teammate) we perform a short deterministic
+ *    back+turn(+forward) maneuver, then resume the current objective (target/base), instead of oscillating/stalling.
+ *  - When near-base / likely teammate traffic, the maneuver is "SOFT" (minimal direction change).
+ *  - When very close / head-on / strong obstacle, the maneuver is "HARD" (bigger break).
+ *  - Improved collision logging with chosen turn side, phase, and classification.
  */
 
 #include "team1.hpp"
@@ -10,6 +17,8 @@
 #include <algorithm>
 #include <limits>
 #include <mutex>
+#include <cmath>
+#include <iomanip>
 
 namespace argos {
 
@@ -271,6 +280,12 @@ Controller1::Controller1() :
     m_uPostDropTimer(0),
     m_uSearchTurnTimer(0),
     m_fSearchTurnBias(0.0f),
+    m_uStuckCounter(0),
+    m_uAvoidTimer(0),
+    m_uAvoidPhase(0),
+    m_fAvoidTurnSign(1.0f),
+    m_bAvoidHard(false),
+    m_eAvoidResumeState(EState::SEARCH),
     m_uEscapeTimer(0),
     m_fEscapeLeftSpeed(0.0f),
     m_fEscapeRightSpeed(0.0f) {}
@@ -293,28 +308,51 @@ void Controller1::Init(TConfigurationNode& t_tree) {
     m_cLastPos = CVector3(0,0,0);
     m_uStuckCounter = 0;
     m_deqTrafficPoints.clear();
+
     m_uAvoidTimer = 0;
+    m_uAvoidPhase = 0;
+    m_fAvoidTurnSign = 1.0f;
+    m_bAvoidHard = false;
+    m_eAvoidResumeState = EState::SEARCH;
+
     m_uEscapeTimer = 0;
     m_fEscapeLeftSpeed = 0.0f;
     m_fEscapeRightSpeed = 0.0f;
-    
+
+    m_fLastLeftCmd = 0.0f;
+    m_fLastRightCmd = 0.0f;
+    m_fPrevGoalDist = std::numeric_limits<Real>::max();
+    m_fBestGoalDist = std::numeric_limits<Real>::max();
+    m_uNoProgressCounter = 0;
+    m_uTeamDeadlockCounter = 0;
+    m_uTeamDeadlockRetries = 0;
+    m_bTeamRecoveryActive = false;
+    m_uTeamRecoveryTimer = 0;
+    m_uTeamRecoveryPhase = 0;
+    m_eResumeState = EState::SEARCH;
+    m_uLastSummaryStep = 0;
+
+    m_cTeammateAvoidLPF = CVector2();
+    m_uTeammateAvoidHold = 0u;
+
     SetWheelSpeeds(0.0f, 0.0f);
 }
 
 Real Controller1::Clamp(Real v, Real lo, Real hi) {
     return (v < lo ? lo : (v > hi ? hi : v));
-    LOGERR<<"sdds";
 }
 
 void Controller1::SetWheelSpeeds(Real fLeft, Real fRight) {
     fLeft = Clamp(fLeft, -kMaxSpeed, kMaxSpeed);
     fRight = Clamp(fRight, -kMaxSpeed, kMaxSpeed);
+    m_fLastLeftCmd = fLeft;
+    m_fLastRightCmd = fRight;
     m_pcWheels->SetLinearVelocity(fLeft, fRight);
 }
 
 Controller1::SPerception Controller1::Sense() {
     SPerception s;
-    
+
     const auto& pr = m_pcPositioning->GetReading();
     s.Position = pr.Position;
     CRadians z, y, x;
@@ -339,19 +377,31 @@ Controller1::SPerception Controller1::Sense() {
 
     s.FoodWorldPositions.clear();
     s.HasFoodInView = false;
+    s.HasRobotInView = false;
+    s.NearestRobotDist = std::numeric_limits<Real>::max();
+    s.NearestRobotBearing = CRadians::ZERO;
     s.NearestFoodMetric = std::numeric_limits<Real>::max();
     s.NearestFoodWorldPos.Set(0.0f, 0.0f, 0.0f);
 
     const auto& cam = m_pcCamera->GetReadings();
     s.FoodWorldPositions.reserve(cam.BlobList.size());
     for(const auto& blob : cam.BlobList) {
-        if(blob->Color != CColor::GRAY80) continue;
+        // Food is reported as GRAY80; non-gray blobs are robots (team LEDs).
+        if(blob->Color != CColor::GRAY80) {
+            Real rdist = blob->Distance / 100.0f;
+            if(rdist < s.NearestRobotDist) {
+                s.NearestRobotDist = rdist;
+                s.NearestRobotBearing = blob->Angle;
+                s.HasRobotInView = true;
+            }
+            continue;
+        }
         Real dist = blob->Distance / 100.0f;
         CRadians ang = s.Yaw + blob->Angle;
         CVector3 wpos(s.Position.GetX() + dist * Cos(ang),
                       s.Position.GetY() + dist * Sin(ang),
                       0.0f);
-                      
+
         // --- ANTI-GHOSTING FILTER ---
         // If this food is near a carrier, it's not real floor food. Ignore it!
         if (SM().IsNearCarrier(wpos, m_uStepCount)) {
@@ -428,8 +478,54 @@ void Controller1::DoMemorySync(const SPerception& s) {
     }
 }
 
-inline void LogWithId(const std::string& id, uint32_t step, const std::string& msg) {
-    std::cout << "[R:" << id << "][Step " << step << "] " << msg << std::endl;
+inline int ParseNumericId(const std::string& id) {
+    // Expected ids like "puck1-0" / "pipuck1-0" / "robot0". Fallback to 0.
+    int num = 0;
+    for(int i = static_cast<int>(id.size()) - 1; i >= 0; --i) {
+        if(id[i] >= '0' && id[i] <= '9') {
+            int j = i;
+            while(j >= 0 && id[j] >= '0' && id[j] <= '9') --j;
+            try {
+                num = std::stoi(id.substr(j + 1, i - j));
+            } catch(...) { num = 0; }
+            break;
+        }
+    }
+    return num;
+}
+
+inline const char* StateToStr(Controller1::EState st) {
+    switch(st) {
+        case Controller1::EState::SEARCH: return "SEARCH";
+        case Controller1::EState::TARGET_LOCKING: return "TARGET_LOCKING";
+        case Controller1::EState::GO_TO_TARGET: return "GO_TO_TARGET";
+        case Controller1::EState::RETURN_TO_BASE: return "RETURN_TO_BASE";
+        case Controller1::EState::AVOID_COLLISION: return "AVOID_COLLISION";
+        case Controller1::EState::BLOCK_ENEMY: return "BLOCK_ENEMY";
+        case Controller1::EState::ESCAPE_STUCK: return "ESCAPE_STUCK";
+        default: return "UNKNOWN";
+    }
+}
+
+inline void LogKV(uint32_t step,
+                  const std::string& rid,
+                  Controller1::EState st,
+                  bool has_food,
+                  const std::optional<std::size_t>& target_id,
+                  const CVector3& target_pos,
+                  const std::string& action,
+                  const std::string& kv) {
+    const Real t = static_cast<Real>(step) / 10.0f; // ticks_per_second=10
+    std::cout << "[t=" << t << "][R:" << rid << "][Step:" << step << "][State:" << StateToStr(st) << "] "
+              << "has_food=" << (has_food ? 1 : 0) << " "
+              << "target_id=";
+    if(target_id.has_value()) std::cout << *target_id;
+    else std::cout << "none";
+    std::cout << " "
+              << "target_pos=(" << target_pos.GetX() << "," << target_pos.GetY() << ") "
+              << "action=" << action;
+    if(!kv.empty()) std::cout << " " << kv;
+    std::cout << std::endl;
 }
 
 bool Controller1::TrySelectCandidateFromMemory(const CVector3& cMyPos, CVector3& cOutPos) const {
@@ -461,39 +557,119 @@ void Controller1::UpdateTrafficPoints(const SPerception& s) {
 void Controller1::ControlStep() {
     const std::string id = GetId();
     ++m_uStepCount;
+    const EState state_before = m_eState;
 
     // --- CARRIER BROADCAST ---
-    // If I have food, tell the Hive Mind my position so others ignore my food!
     if (hasFood()) {
         SM().ReportCarrier(m_pcPositioning->GetReading().Position, m_uStepCount);
     }
 
     SPerception s = Sense();
 
-    // --- STUCK DETECTION & ESCAPE ---
-    if((s.Position - m_cLastPos).Length() < 0.03f) {
-        ++m_uStuckCounter;
-    } else {
-        m_uStuckCounter = 0;
-        m_cLastPos = s.Position; 
+    // --- STUCK / TEAM-DEADLOCK DETECTION & BOUNDED RECOVERY (deterministic) ---
+    const int my_num_id = ParseNumericId(id);
+
+    // Track basic motion
+    const Real pos_delta = (s.Position - m_cLastPos).Length();
+    if(pos_delta < 0.01f) ++m_uStuckCounter;
+    else m_uStuckCounter = 0;
+    m_cLastPos = s.Position;
+
+    // Compute current goal distance (for progress tracking)
+    Real goal_dist = std::numeric_limits<Real>::max();
+    if(m_eState == EState::GO_TO_TARGET && m_bHasLockedTarget) {
+        goal_dist = (m_cLockedTargetPos - s.Position).Length();
+    } else if(m_eState == EState::RETURN_TO_BASE) {
+        goal_dist = (SelectClosestBase(s.Position) - s.Position).Length();
     }
 
-    // fast unstuck behave
-    if(m_uStuckCounter > 10 && m_eState != EState::ESCAPE_STUCK) {
-        m_ePrevState = m_eState;
-        //m_fSearchTurnBias = (m_rng->Uniform(CRange<Real>(0.0f, 1.0f)) > 0.5f ? 1.5f : -1.5f);
-        m_eState = EState::ESCAPE_STUCK;
-        
-        m_uEscapeTimer = 80;
-        m_fSearchTurnBias = m_rng->Uniform(CRange<Real>(-1.0f, 1.0f));
-        m_fEscapeLeftSpeed = -kMaxSpeed;
-        m_fEscapeRightSpeed = -kMaxSpeed * 0.1f;
-        
-        if (m_rng->Uniform(CRange<Real>(0.0f, 1.0f)) < 0.5f) {
-            std::swap(m_fEscapeLeftSpeed, m_fEscapeRightSpeed);
+    if(goal_dist < m_fBestGoalDist - 0.02f) {
+        m_fBestGoalDist = goal_dist;
+        m_uNoProgressCounter = 0;
+    } else {
+        if(goal_dist < std::numeric_limits<Real>::max()) ++m_uNoProgressCounter;
+    }
+    const Real dd_goal = (m_fPrevGoalDist < std::numeric_limits<Real>::max() && goal_dist < std::numeric_limits<Real>::max())
+                         ? (goal_dist - m_fPrevGoalDist)
+                         : 0.0f;
+    m_fPrevGoalDist = goal_dist;
+
+    const bool wheels_push = (Abs(m_fLastLeftCmd) + Abs(m_fLastRightCmd)) > (1.0f * kMaxSpeed);
+    const bool robot_front_block = s.HasRobotInView && (s.NearestRobotDist < 0.18f) && (Abs(s.NearestRobotBearing.GetValue()) < 0.45f);
+
+    // Specialized trigger: likely head-on / bumper lock
+    if(!m_bTeamRecoveryActive &&
+       m_eState != EState::ESCAPE_STUCK &&
+       m_eState != EState::AVOID_COLLISION &&
+       robot_front_block &&
+       wheels_push &&
+       pos_delta < 0.01f &&
+       m_uNoProgressCounter > 8) {
+        ++m_uTeamDeadlockCounter;
+        if(m_uTeamDeadlockCounter == 1 || m_uTeamDeadlockCounter == 10) {
+            LogKV(m_uStepCount, id, m_eState, hasFood(), m_optLockedMemoryIndex,
+                  (m_bHasLockedTarget ? m_cLockedTargetPos : SelectClosestBase(s.Position)),
+                  "TEAM_DEADLOCK_DETECTED",
+                  "pos_delta=" + std::to_string(pos_delta) +
+                  " front_robot_dist=" + std::to_string(s.NearestRobotDist) +
+                  " bearing=" + std::to_string(s.NearestRobotBearing.GetValue()) +
+                  " dd_goal=" + std::to_string(dd_goal) +
+                  " retries=" + std::to_string(m_uTeamDeadlockRetries));
+        }
+    } else {
+        m_uTeamDeadlockCounter = 0;
+    }
+
+    const uint32_t kDeadlockTriggerSteps = 14;
+    if(!m_bTeamRecoveryActive &&
+       m_uTeamDeadlockCounter >= kDeadlockTriggerSteps &&
+       m_eState != EState::ESCAPE_STUCK) {
+
+        // Too many retries => release lock ONLY for food target (not base)
+        if(m_uTeamDeadlockRetries >= 3 && m_eState == EState::GO_TO_TARGET) {
+            LogKV(m_uStepCount, id, m_eState, hasFood(), m_optLockedMemoryIndex,
+                  m_cLockedTargetPos,
+                  "LOCK_RELEASED",
+                  "reason=TEAM_DEADLOCK_RETRIES");
+            ReleaseLockedTarget(false);
+            m_eState = EState::SEARCH;
+            m_uTeamDeadlockRetries = 0;
+            m_uTeamDeadlockCounter = 0;
+        } else {
+            m_ePrevState = m_eState;
+            m_eResumeState = m_eState;
+            m_eState = EState::ESCAPE_STUCK;
+            m_bTeamRecoveryActive = true;
+            m_uTeamRecoveryPhase = 0;
+            m_uTeamRecoveryTimer = 0;
+            ++m_uTeamDeadlockRetries;
+
+            LogKV(m_uStepCount, id, m_ePrevState, hasFood(), m_optLockedMemoryIndex,
+                  (m_bHasLockedTarget ? m_cLockedTargetPos : SelectClosestBase(s.Position)),
+                  "TEAM_DEADLOCK_RECOVERY",
+                  "phase=reverse resume_state=" + std::string(StateToStr(m_eResumeState)));
         }
     }
-    
+
+    // Generic stuck fallback
+    if(!m_bTeamRecoveryActive &&
+       m_uStuckCounter > 18 &&
+       m_eState != EState::ESCAPE_STUCK &&
+       m_eState != EState::AVOID_COLLISION) {
+        m_ePrevState = m_eState;
+        m_eResumeState = m_eState;
+        m_eState = EState::ESCAPE_STUCK;
+        m_bTeamRecoveryActive = true;
+        m_uTeamRecoveryPhase = 0;
+        m_uTeamRecoveryTimer = 0;
+        m_uTeamDeadlockRetries = 0;
+
+        LogKV(m_uStepCount, id, m_ePrevState, hasFood(), m_optLockedMemoryIndex,
+              (m_bHasLockedTarget ? m_cLockedTargetPos : SelectClosestBase(s.Position)),
+              "TEAM_DEADLOCK_RECOVERY",
+              "phase=reverse reason=GENERIC_STUCK resume_state=" + std::string(StateToStr(m_eResumeState)));
+    }
+
     // --- UNIVERSAL FOOD CHECK ---
     if(hasFood()) {
         m_bHasCandidateTarget = false;
@@ -509,15 +685,49 @@ void Controller1::ControlStep() {
     DoMemorySync(s);
     UpdateTrafficPoints(s);
 
-    // Collision Check
+    // === Collision Check (ALL states except ESCAPE_STUCK; includes RETURN_TO_BASE) ===
     if(m_eState != EState::AVOID_COLLISION &&
-       m_eState != EState::RETURN_TO_BASE &&
        m_eState != EState::ESCAPE_STUCK &&
-       m_uPostDropTimer == 0 && 
-       s.ProximityLevel > kCollisionTrigger)
-    {
+       m_uPostDropTimer == 0 &&
+       s.ProximityLevel > kCollisionTrigger) {
+
         m_ePrevState = m_eState;
+        m_eAvoidResumeState = m_eState;
         m_eState = EState::AVOID_COLLISION;
+
+        // Reset routine
+        m_uAvoidTimer = 0;
+        m_uAvoidPhase = 0;
+
+        // Deterministic turn side: break symmetry by id + robot bearing (if exists)
+        const Real bear = s.HasRobotInView ? s.NearestRobotBearing.GetValue() : 0.0f;
+        const int id_sign = (my_num_id % 2 == 0) ? 1 : -1;
+        const int bear_sign = (bear >= 0.0f) ? 1 : -1;
+        // turn away from bearing; id breaks ties
+        m_fAvoidTurnSign = static_cast<Real>(-id_sign * bear_sign);
+
+        // Classify encounter:
+        // - Near base tends to be teammate traffic => SOFT (minimal direction change)
+        // - Very close / head-on / strong contact => HARD
+        const Real base_dist = (SelectClosestBase(s.Position) - s.Position).Length();
+        const bool near_base = base_dist < 0.65f;
+
+        const bool very_close = s.HasRobotInView && std::isfinite(s.NearestRobotDist) && (s.NearestRobotDist < 0.16f);
+        const bool head_on = s.HasRobotInView && std::isfinite(s.NearestRobotDist) &&
+                             (s.NearestRobotDist < 0.18f) && (Abs(s.NearestRobotBearing.GetValue()) < 0.30f);
+        const bool strong_contact = (s.ProximityLevel < 0.040f); // close wall/robot
+
+        m_bAvoidHard = (!near_base) && (very_close || head_on || strong_contact);
+
+        LogKV(m_uStepCount, id, m_ePrevState, hasFood(), m_optLockedMemoryIndex,
+              (m_bHasLockedTarget ? m_cLockedTargetPos : SelectClosestBase(s.Position)),
+              "AVOID_COLLISION_ENTER",
+              "prox=" + std::to_string(s.ProximityLevel) +
+              (s.HasRobotInView ? (" robot_dist=" + std::to_string(s.NearestRobotDist) +
+                                   " robot_bearing=" + std::to_string(s.NearestRobotBearing.GetValue())) : "") +
+              " mode=" + std::string(m_bAvoidHard ? "HARD" : "SOFT") +
+              " turn_sign=" + std::to_string(m_fAvoidTurnSign) +
+              " resume_state=" + std::string(StateToStr(m_eAvoidResumeState)));
     }
 
     if(m_uPostDropTimer > 0) --m_uPostDropTimer;
@@ -526,47 +736,141 @@ void Controller1::ControlStep() {
     CVector2 cExtra(0.0f, 0.0f);
     Real speedScale = 1.0f;
     Real turnGain = 1.6f;
-    if (m_eState != EState::AVOID_COLLISION) {
-        m_uAvoidTimer = 0;
-    }
+
     switch(m_eState) {
-        
+
         case EState::ESCAPE_STUCK: {
-            SetWheelSpeeds(m_fEscapeLeftSpeed, m_fEscapeRightSpeed);
-            if (m_uEscapeTimer > 0) {
-                --m_uEscapeTimer;
-            } else {
-                m_uStuckCounter = 0; 
-                
-                if (m_ePrevState == EState::GO_TO_TARGET || m_ePrevState == EState::TARGET_LOCKING) {
-                    ReleaseLockedTarget(false); 
-                }
-                
+            // Deterministic bounded recovery (used for teammate-deadlock + generic stuck)
+            if(!m_bTeamRecoveryActive) {
                 m_eState = EState::SEARCH;
-                m_uSearchTurnTimer = 0;
-            }
-            return; 
-        }
-        case EState::AVOID_COLLISION: {
-            CVector2 cAvoid = s.AvoidanceVector;
-            if(cAvoid.Length() < 1e-6f) {
-                SetWheelSpeeds(-kMaxSpeed * 0.5f, kMaxSpeed * 0.5f); 
+                m_uStuckCounter = 0;
                 return;
             }
-            cAvoid.Normalize();
 
-            CVector2 cTangent(-cAvoid.GetY(), cAvoid.GetX());
-            
-            CVector2 cNewDir = (cAvoid * 0.6f) + (cTangent * 0.8f);
-            
-            DriveWithVector(s, cNewDir, 0.7f, 2.5f, CVector2(0,0));
+            const Real bear = s.HasRobotInView ? s.NearestRobotBearing.GetValue() : 0.0f;
+            const int id_sign = (my_num_id % 2 == 0) ? 1 : -1;
+            const int bear_sign = (bear >= 0.0f) ? 1 : -1;
+            const int turn_sign = -id_sign * bear_sign; // rotate away, break symmetry by id
 
-            if(s.ProximityLevel < kCollisionClear) {
-                m_eState = hasFood() ? EState::RETURN_TO_BASE : m_ePrevState;
+            constexpr uint32_t T_REV = 10;
+            constexpr uint32_t T_ROT = 10;
+            constexpr uint32_t T_FWD = 14;
+
+            if(m_uTeamRecoveryPhase == 0) {
+                SetWheelSpeeds(-0.8f * kMaxSpeed, -0.8f * kMaxSpeed);
+                ++m_uTeamRecoveryTimer;
+                if(m_uTeamRecoveryTimer >= T_REV) {
+                    m_uTeamRecoveryPhase = 1;
+                    m_uTeamRecoveryTimer = 0;
+                    LogKV(m_uStepCount, id, m_ePrevState, hasFood(), m_optLockedMemoryIndex,
+                          (m_bHasLockedTarget ? m_cLockedTargetPos : SelectClosestBase(s.Position)),
+                          "TEAM_DEADLOCK_RECOVERY",
+                          "phase=rotate resume_state=" + std::string(StateToStr(m_eResumeState)));
+                }
+                return;
+            }
+
+            if(m_uTeamRecoveryPhase == 1) {
+                SetWheelSpeeds(-turn_sign * 0.6f * kMaxSpeed, turn_sign * 0.6f * kMaxSpeed);
+                ++m_uTeamRecoveryTimer;
+                if(m_uTeamRecoveryTimer >= T_ROT) {
+                    m_uTeamRecoveryPhase = 2;
+                    m_uTeamRecoveryTimer = 0;
+                    LogKV(m_uStepCount, id, m_ePrevState, hasFood(), m_optLockedMemoryIndex,
+                          (m_bHasLockedTarget ? m_cLockedTargetPos : SelectClosestBase(s.Position)),
+                          "TEAM_DEADLOCK_RECOVERY",
+                          "phase=forward resume_state=" + std::string(StateToStr(m_eResumeState)));
+                }
+                return;
+            }
+
+            SetWheelSpeeds(0.9f * kMaxSpeed, 0.9f * kMaxSpeed);
+            ++m_uTeamRecoveryTimer;
+            if(m_uTeamRecoveryTimer >= T_FWD) {
+                m_bTeamRecoveryActive = false;
+                m_uTeamRecoveryTimer = 0;
+                m_uTeamRecoveryPhase = 0;
+                m_uTeamDeadlockCounter = 0;
+                m_uStuckCounter = 0;
+                m_uNoProgressCounter = 0;
+                m_fBestGoalDist = std::numeric_limits<Real>::max();
+
+                const EState resume = hasFood() ? EState::RETURN_TO_BASE : m_eResumeState;
+                m_eState = resume;
+
+                LogKV(m_uStepCount, id, m_eState, hasFood(), m_optLockedMemoryIndex,
+                      (m_bHasLockedTarget ? m_cLockedTargetPos : SelectClosestBase(s.Position)),
+                      "TEAM_DEADLOCK_RECOVERY",
+                      "phase=done resume_state=" + std::string(StateToStr(resume)));
+            }
+            return;
+        }
+
+        case EState::AVOID_COLLISION: {
+            // NEW: break direction briefly then resume objective (does not wait for "clear" forever)
+            // Soft (teammates): minimal heading change (shorter turn + more forward)
+            // Hard (enemy/head-on): stronger back+turn to guarantee separation
+
+            const uint32_t T_BACK = m_bAvoidHard ? 9u : 5u;
+            const uint32_t T_TURN = m_bAvoidHard ? 14u : 7u;
+            const uint32_t T_FWD  = m_bAvoidHard ? 10u : 7u;
+
+            // If we were pushed into a wall, back up even if sensors flicker
+            if(m_uAvoidPhase == 0) {
+                const Real back = m_bAvoidHard ? 0.85f : 0.60f;
+                SetWheelSpeeds(-back * kMaxSpeed, -back * kMaxSpeed);
+                ++m_uAvoidTimer;
+                if(m_uAvoidTimer >= T_BACK) {
+                    m_uAvoidPhase = 1;
+                    m_uAvoidTimer = 0;
+                    LogKV(m_uStepCount, id, m_eState, hasFood(), m_optLockedMemoryIndex,
+                          (m_bHasLockedTarget ? m_cLockedTargetPos : SelectClosestBase(s.Position)),
+                          "AVOID_COLLISION_PHASE",
+                          "phase=TURN mode=" + std::string(m_bAvoidHard ? "HARD" : "SOFT") +
+                          " turn_sign=" + std::to_string(m_fAvoidTurnSign));
+                }
+                return;
+            }
+
+            if(m_uAvoidPhase == 1) {
+                const Real turn = m_bAvoidHard ? 0.75f : 0.45f;
+                // arc turn: one wheel forward, one backward (quick reorientation)
+                SetWheelSpeeds(-m_fAvoidTurnSign * turn * kMaxSpeed,
+                                m_fAvoidTurnSign * turn * kMaxSpeed);
+                ++m_uAvoidTimer;
+                if(m_uAvoidTimer >= T_TURN) {
+                    m_uAvoidPhase = 2;
+                    m_uAvoidTimer = 0;
+                    LogKV(m_uStepCount, id, m_eState, hasFood(), m_optLockedMemoryIndex,
+                          (m_bHasLockedTarget ? m_cLockedTargetPos : SelectClosestBase(s.Position)),
+                          "AVOID_COLLISION_PHASE",
+                          "phase=FWD mode=" + std::string(m_bAvoidHard ? "HARD" : "SOFT"));
+                }
+                return;
+            }
+
+            // phase 2 forward (re-engage the lane)
+            const Real fwd = m_bAvoidHard ? 0.95f : 0.80f;
+            SetWheelSpeeds(fwd * kMaxSpeed, fwd * kMaxSpeed);
+            ++m_uAvoidTimer;
+
+            // Early exit if sensors show clear
+            const bool clear_now = (s.ProximityLevel < kCollisionClear);
+            if(clear_now || m_uAvoidTimer >= T_FWD) {
+                const EState resume = hasFood() ? EState::RETURN_TO_BASE : m_eAvoidResumeState;
+                LogKV(m_uStepCount, id, m_eState, hasFood(), m_optLockedMemoryIndex,
+                      (m_bHasLockedTarget ? m_cLockedTargetPos : SelectClosestBase(s.Position)),
+                      "AVOID_COLLISION_EXIT",
+                      "resume_state=" + std::string(StateToStr(resume)) +
+                      " clear=" + std::to_string(clear_now ? 1 : 0));
+                m_eState = resume;
+                m_uAvoidTimer = 0;
+                m_uAvoidPhase = 0;
                 m_uStuckCounter = 0;
             }
             return;
         }
+
         case EState::SEARCH: {
             if(hasFood()) {
                 m_eState = EState::RETURN_TO_BASE;
@@ -748,19 +1052,19 @@ void Controller1::ControlStep() {
             CVector3 base = SelectClosestBase(s.Position);
             CVector3 diff3 = base - s.Position;
             Real distToBase = diff3.Length();
-            
+
             cNav.Set(diff3.GetX(), diff3.GetY());
             if(cNav.Length() > 0.0f) cNav.Normalize(); 
-            
-            // Base Push: Ignore others when very close to base to prevent Yo-Yo
+
+            const bool obstacle_close = (s.ProximityLevel < 0.065f);
             if (distToBase < 0.35f) {
-                cExtra = s.AvoidanceVector * 0.2f; 
+                cExtra = obstacle_close ? (s.AvoidanceVector * 0.7f) : CVector2();
             } else {
-                cExtra = s.AvoidanceVector * 2.1f; 
+                cExtra = obstacle_close ? (s.AvoidanceVector * 2.0f) : CVector2();
             }
-            
-            speedScale = 1.0f;
-            turnGain = 1.7f;
+
+            speedScale = (distToBase < 0.65f ? 0.70f : 1.0f);
+            turnGain = 2.1f;
             break;
         }
 
@@ -808,21 +1112,113 @@ void Controller1::ControlStep() {
         if(cExtra.Length() > 1e-6f) {
             CVector2 extraN = cExtra; extraN.Normalize();
             Real dot = navN.GetX()*extraN.GetX() + navN.GetY()*extraN.GetY();
-            
             if(dot < -0.6f) {
-                cExtra*= 0.35f;//.Set(-cExtra.GetY(), cExtra.GetX()); 
+                cExtra *= 0.35f;
             }
         }
     }
-    // smooth forces
-    if (s.ProximityLevel > 0.05f) {
-        Real damping = Clamp(1.0f - (s.ProximityLevel * 2.0f), 0.1f, 1.0f);
+
+    // Smooth forces: apply only when close to obstacles.
+    if (s.ProximityLevel < 0.065f) {
+        Real damping = Clamp(s.ProximityLevel / 0.065f, 0.15f, 1.0f);
         cNav *= damping;
     }
-    
+
+    // --- Layer A: robot-robot prevention: repulse + tangential slide + deterministic yield ---
+    if(m_eState != EState::AVOID_COLLISION &&
+       m_eState != EState::ESCAPE_STUCK &&
+       s.HasRobotInView) {
+
+        const Real personal_space = 0.22f;
+        const Real exit_space     = 0.26f;
+
+        if(!std::isfinite(s.NearestRobotDist) || s.NearestRobotDist > exit_space) {
+            m_cTeammateAvoidLPF = CVector2();
+            m_uTeammateAvoidHold = 0u;
+        }
+
+        if(s.NearestRobotDist < personal_space && std::isfinite(s.NearestRobotDist)) {
+            const Real w = Clamp((personal_space - s.NearestRobotDist) / personal_space, 0.0f, 1.0f);
+
+            CVector2 repulse; repulse.FromPolarCoordinates(s.NearestRobotDist, s.NearestRobotBearing);
+            if(repulse.Length() > 1e-6f) repulse.Normalize();
+            repulse *= -1.0f;
+
+            CVector2 tangent(-repulse.GetY(), repulse.GetX());
+            const Real side = (my_num_id % 2 == 0) ? 1.0f : -1.0f;
+            tangent *= side;
+
+            const Real base_dist = (SelectClosestBase(s.Position) - s.Position).Length();
+            const bool near_base = base_dist < 0.65f;
+            const Real base_boost = near_base ? 1.8f : 1.0f;
+
+            CVector2 avoidRaw = (repulse * (3.2f * w * base_boost)) + (tangent * (2.2f * w * base_boost));
+
+            if(cNav.Length() > 0.01f) {
+                CVector2 goal = cNav;
+                goal.Normalize();
+                avoidRaw += goal * (1.2f * w);
+            }
+
+            const Real alpha = 0.75f;
+            if(m_uTeammateAvoidHold == 0u) {
+                m_cTeammateAvoidLPF = avoidRaw;
+            } else {
+                m_cTeammateAvoidLPF = (m_cTeammateAvoidLPF * alpha) + (avoidRaw * (1.0f - alpha));
+            }
+            m_uTeammateAvoidHold = 5u;
+
+            const Real maxMag = 4.0f * base_boost;
+            if(m_cTeammateAvoidLPF.Length() > maxMag) {
+                m_cTeammateAvoidLPF.Normalize();
+                m_cTeammateAvoidLPF *= maxMag;
+            }
+
+            cExtra += m_cTeammateAvoidLPF;
+
+            const bool head_on = (s.NearestRobotDist < 0.14f) && (Abs(s.NearestRobotBearing.GetValue()) < 0.25f);
+            if(head_on) {
+                const bool i_yield = (my_num_id % 2) == 0;
+                if(i_yield) speedScale = std::min<argos::Real>(speedScale, argos::Real(0.45));
+                else        speedScale = std::max<argos::Real>(speedScale, argos::Real(0.65));
+            } else {
+                speedScale = std::max<argos::Real>(speedScale, argos::Real(0.65));
+            }
+        }
+
+        const Real hold_space = 0.22f;
+        if (m_uTeammateAvoidHold > 0u && std::isfinite(s.NearestRobotDist) && s.NearestRobotDist < hold_space) {
+            cExtra += m_cTeammateAvoidLPF * 0.60f;
+            speedScale = std::max<argos::Real>(speedScale, argos::Real(0.75));
+            --m_uTeammateAvoidHold;
+        }
+    }
+
+    // Periodic summary (every 20 steps)
+    if(m_uStepCount % 20 == 0) {
+        CVector3 tpos(0.0f, 0.0f, 0.0f);
+        if(m_bHasLockedTarget) tpos = m_cLockedTargetPos;
+        else if(hasFood()) tpos = SelectClosestBase(s.Position);
+        LogKV(m_uStepCount, id, m_eState, hasFood(), m_optLockedMemoryIndex,
+              tpos,
+              "SUMMARY",
+              "pos=(" + std::to_string(s.Position.GetX()) + "," + std::to_string(s.Position.GetY()) + ")" +
+              " prox=" + std::to_string(s.ProximityLevel) +
+              (s.HasRobotInView ? (" robot_dist=" + std::to_string(s.NearestRobotDist) +
+                                   " robot_bearing=" + std::to_string(s.NearestRobotBearing.GetValue())) : ""));
+    }
+
+    // State change logging
+    if(m_eState != state_before) {
+        LogKV(m_uStepCount, id, m_eState, hasFood(), m_optLockedMemoryIndex,
+              (m_bHasLockedTarget ? m_cLockedTargetPos : (hasFood() ? SelectClosestBase(s.Position) : CVector3(0,0,0))),
+              "STATE_CHANGE",
+              "from=" + std::string(StateToStr(state_before)) + " to=" + std::string(StateToStr(m_eState)));
+    }
+
     DriveWithVector(s, cNav, speedScale, turnGain, cExtra);
 }
 
-REGISTER_CONTROLLER(Controller1, "controller1");
-
 } // namespace argos
+
+REGISTER_CONTROLLER(Controller1, "controller1");
